@@ -1,0 +1,48 @@
+Business Problem
+Due to the credit system in America, there are many people that find it difficult or impossible to get a loan. Home Credit aims for financial inclusion by providing loan services this
+demographic while controlling default risk. 
+The aim of this project is to create a default risk model using alternative historical data that maximizes assessment accuracy.
+
+Benefit of a Solution
+The results of this project will:
+• Increase the number of loan approvals while controlling risk, leading to a larger
+customer base.
+• Decrease losses due to defaulting, improving profitability.
+• Financially empowering more customers.
+
+Analytics Approach
+Data Preparation
+To clean up the provided data, we handled NAs, factorized character / categorical variables, and removed variables that did not have a significant impact on the target variable.
+We selected the top variables with higher predictive power to remove noise from the dataset and enhance model performance.
+We also utlized feature engineering to boost the model's AUC.
+
+Key Findings
+The most important features that we found (in order of significance) were: EXT_SOURCE_MED, EXT_SOURCE_2 & 3, RATIO_AMT_ANNUITY_TO_AMT_CREDIT, RATIO_AMT_CREDIT_TO_AMT_ANNUITY, AMT_ANNUITY, DAYS_EMPLOYED, AMT_GOODS_PRICE.
+
+Modelling
+We created logistic regression, random forest, and boosted tree models and compared their performance based on AUC.
+With these models, we performed a grid search method to choose the best hyperparameter settings.
+Our top performing model was our boosted tree model, with an AUC of 754.
+
+Key Findings
+The most i
+
+Individual Contribution
+Each of us created our own EDA files and models and compared the model performances.
+I tinkered with the random forest and random forest models for our final model selections.
+
+Business Value
+The final model delivers the following business benefits:
+- The model has a 91.5% classification accuracy with AUC of 0.754.
+- The model identifies high risk customers that will help the company reduce defaults.
+- This will in turn reduce losses from defaults while maximizing approved loans from reliable customers.
+
+Challenges:
+One thing that we struggled with that we could improve upon is the use of alternative datasets to include into the model to fit the company's mission of financial inclusion better.
+I believe there is more we could've done to be more creative with the feature engineering to boost the AUC further.
+
+Tech Stack Used:
+- Language: R
+- Libraries: tidymodels, tidyverse, caret, pROC, grf, lightgbm, xgboost,bonsai, vip.
+- Modelling Approach: Tidymodels workflow with cross-validation and hyperparameter turning.
+- Validation: 5-fold cross-validation on 80/20 train-test split.
