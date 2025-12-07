@@ -1,0 +1,419 @@
+---
+title: "EDA Assignment - Leilanie Coker"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+
+---
+## Load and Inspect Data
+```{r}
+# Load libraries
+library(tidyverse)
+library(skimr)
+library(ggplot2)
+library(psych)
+library(caret)
+
+# Load Data & convert to factors
+train <- read.csv("application_train.csv", stringsAsFactors = TRUE, na.strings=c("", "NA"))
+test  <- read.csv("application_test.csv", stringsAsFactors = TRUE, na.strings=c("", "NA"))
+
+# Inspect Data
+glimpse(train)
+glimpse(test)
+
+summary(train)
+summary(test)
+
+str(train)
+str(test)
+
+# Skim pass
+skim_train <- skim(train)
+skim_test <- skim(test)
+```
+## Missing Data
+There are variables in both train and test data with a high percentage of missing data.
+To handle these, I'll drop these features if they have a high percentage (60%+) of missing data for both the datasets.
+```{r}
+high_miss_cut <- 60
+
+n_train <- nrow(train)
+n_test  <- nrow(test)
+
+miss_train_skim <- skim_train |>
+  distinct(skim_variable, n_missing) |>
+  mutate(pct_miss = 100 * n_missing / n_train)
+
+miss_test_skim <- skim_test |>
+  distinct(skim_variable, n_missing) |>
+  mutate(pct_miss = 100 * n_missing / n_test)
+
+# Variables to drop (60% or higher)
+hi_union <- union(
+  miss_train_skim |> filter(pct_miss >= high_miss_cut) |> pull(skim_variable),
+  miss_test_skim  |> filter(pct_miss >= high_miss_cut) |> pull(skim_variable)
+)
+
+# Drop
+drop_vars <- hi_union
+train <- train |> select(-any_of(intersect(drop_vars, names(train))))
+test  <- test  |> select(-any_of(intersect(drop_vars, names(test))))
+
+# Checking to make sure it worked
+length(drop_vars)                 
+intersect(drop_vars, names(train))
+intersect(drop_vars, names(test)) 
+```
+17 variables were dropped from both train and test.
+Now there are no variables with missing data at or above 60%.
+
+## Zero Variance Features
+```{r}
+# Identify and filter out zero variance features (if any)
+nuniq_train <- sapply(train, function(x) dplyr::n_distinct(x, na.rm = TRUE))
+nuniq_test  <- sapply(test,  function(x) dplyr::n_distinct(x, na.rm = TRUE))
+
+zerovar_train <- tibble(variable = names(train),
+                        n_unique = as.integer(nuniq_train)) |>
+  filter(n_unique <= 1) |>
+  arrange(variable)
+
+zerovar_test <- tibble(variable = names(test),
+                       n_unique = as.integer(nuniq_test)) |>
+  filter(n_unique <= 1) |>
+  arrange(variable)
+
+nrow(zerovar_train); nrow(zerovar_test)
+zerovar_train
+zerovar_test    
+```
+0 zero variance variables in train.
+11 zero variance variables in test.
+
+In this case, we'll keep these and make sure that the factor levels are consistent with the train dataset.
+```{r}
+# List from zerovar_test:
+zv_test_only <- c("FLAG_DOCUMENT_10","FLAG_DOCUMENT_12","FLAG_DOCUMENT_13","FLAG_DOCUMENT_14",
+                  "FLAG_DOCUMENT_15","FLAG_DOCUMENT_16","FLAG_DOCUMENT_17","FLAG_DOCUMENT_19",
+                  "FLAG_DOCUMENT_2","FLAG_DOCUMENT_20","FLAG_DOCUMENT_21")
+
+# Make sure factor levels in test match train
+for (v in zv_test_only) {
+  if (v %in% names(train) && v %in% names(test) &&
+      is.factor(train[[v]]) && is.factor(test[[v]])) {
+    test[[v]] <- factor(test[[v]], levels = levels(train[[v]]))
+  }
+}
+```
+
+## Handling Dates
+There are some negative date counts and a DAYS_EMPLOYED sentinel (365243, which apparently means N/A).
+So, we need to convert day counts to years and flat the 365243 counts.
+Using 365.25 to transform b/c it is the approximation of the average length of a year including leap years to avoid shifting too much.
+```{r}
+# Transform train date variables
+train <- train |>
+  mutate(
+    AGE_YEARS         = -DAYS_BIRTH/365.25,
+    EMP_ANOMALY_FLAG  = as.integer(DAYS_EMPLOYED == 365243),
+    EMP_YEARS         = ifelse(DAYS_EMPLOYED == 365243, NA_real_, -DAYS_EMPLOYED/365.25),
+    REG_YEARS         = -DAYS_REGISTRATION/365.25,
+    IDPUB_YEARS       = -DAYS_ID_PUBLISH/365.25,
+    PHONECHANGE_YEARS = -DAYS_LAST_PHONE_CHANGE/365.25
+  )
+
+# Transform test date variables
+test <- test |>
+  mutate(
+    AGE_YEARS         = -DAYS_BIRTH/365.25,
+    EMP_ANOMALY_FLAG  = as.integer(DAYS_EMPLOYED == 365243),
+    EMP_YEARS         = ifelse(DAYS_EMPLOYED == 365243, NA_real_, -DAYS_EMPLOYED/365.25),
+    REG_YEARS         = -DAYS_REGISTRATION/365.25,
+    IDPUB_YEARS       = -DAYS_ID_PUBLISH/365.25,
+    PHONECHANGE_YEARS = -DAYS_LAST_PHONE_CHANGE/365.25
+  )
+
+# Dropping raw DAYS_* so they don't get flagged as outliers.
+drop_days <- c("DAYS_BIRTH","DAYS_EMPLOYED","DAYS_REGISTRATION","DAYS_ID_PUBLISH","DAYS_LAST_PHONE_CHANGE")
+train <- train |> select(-any_of(intersect(drop_days, names(train))))
+test  <- test  |> select(-any_of(intersect(drop_days, names(test))))
+```
+
+## Outliers
+Identify potential outliers in the datasets.
+```{r}
+# Get numeric skim as a tibble and normalize quantile columb names
+sk_num <- skim(train) |>
+  filter(skim_type == "numeric") |>
+  ungroup() |>
+  as_tibble() |>                         # drop grouped_df attrs
+  rename_with(~ sub("^numeric\\.", "", .x))  # turns numeric.p25 -> p25, etc.
+
+# Build IQR flags
+iqr_flags_train <- sk_num |>
+  transmute(
+    variable = skim_variable,
+    p0, p25, p75, p100,
+    iqr = p75 - p25,
+    lo  = p25 - 1.5 * iqr,
+    hi  = p75 + 1.5 * iqr,
+    has_low_out  = !is.na(p0)   & p0   < lo,
+    has_high_out = !is.na(p100) & p100 > hi,
+    any_outliers = has_low_out | has_high_out
+  ) |>
+  ungroup()
+
+# Pull top 20 likely outlier variables
+iqr_flags_train |> filter(any_outliers) |> slice_head(n = 20)
+```
+Some variables here like TARGET and REG_ are binary or ordinal. IQR = 0. This gets flagged but isn't a real outlier.
+
+Some amount variables (AMT_) are highly skewed to the right.
+CNT_ variables are smaller but have noticeable outliers.
+
+To handle these, for the AMT_ variables we can winsorize them on the training set and apply to the test set.
+For CNT_ variables can cap at 99th percentile and keep the floor at 0.
+```{r}
+# AMT variables and CNT variables identified
+amt_vars <- intersect(c("AMT_INCOME_TOTAL","AMT_CREDIT","AMT_ANNUITY","AMT_GOODS_PRICE"), names(train))
+count_vars <- intersect(c("CNT_CHILDREN","CNT_FAM_MEMBERS",
+                          "OBS_30_CNT_SOCIAL_CIRCLE","DEF_30_CNT_SOCIAL_CIRCLE",
+                          "OBS_60_CNT_SOCIAL_CIRCLE","DEF_60_CNT_SOCIAL_CIRCLE",
+                          "AMT_REQ_CREDIT_BUREAU_HOUR","AMT_REQ_CREDIT_BUREAU_DAY",
+                          "AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
+                          "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR"),
+                        names(train))
+
+# log1p transforms for amounts
+for (v in amt_vars) {
+  train[[paste0(v,"_LOG1P")]] <- log1p(as.numeric(train[[v]]))
+  test [[paste0(v,"_LOG1P")]] <- log1p(as.numeric(test [[v]]))
+}
+
+q <- function(x,p) as.numeric(quantile(x, probs=p, na.rm=TRUE, type=7))
+# Cut points on train only
+w_lo <- sapply(train[amt_vars],  q, 0.01); names(w_lo) <- amt_vars
+w_hi <- sapply(train[amt_vars],  q, 0.99); names(w_hi) <- amt_vars
+c_lo <- setNames(rep(0, length(count_vars)), count_vars)
+c_hi <- sapply(train[count_vars], q, 0.99); names(c_hi) <- count_vars
+
+apply_bounds <- function(df, vars, lo, hi){
+  for (v in vars) if (v %in% names(df)) {
+    x <- df[[v]]
+    x <- ifelse(!is.na(x) & x < lo[[v]], lo[[v]], x)
+    x <- ifelse(!is.na(x) & x > hi[[v]], hi[[v]], x)
+    df[[v]] <- x
+  }
+  df
+}
+# Apply on test using train thresholds.
+train <- apply_bounds(train, amt_vars,  w_lo, w_hi)  # winsor amounts
+test  <- apply_bounds(test,  amt_vars,  w_lo, w_hi)
+
+train <- apply_bounds(train, count_vars, c_lo, c_hi) # cap counts [0, p99]
+test  <- apply_bounds(test,  count_vars, c_lo, c_hi)
+```
+
+# Explore Target
+```{r}
+# Explore Target
+str(train$TARGET)
+summary(train$TARGET)
+```
+The data is unbalanced. Mean = 0.08073.
+Meaning, there are about 8.07% defaults and 91.93% non-defaults. A majority-class classifier predicting non-defaults would have 91.93% accuracy.
+```{r}
+# Visualize Target
+ggplot(as.data.frame(table(train$TARGET)),
+       aes(x = as.factor(Var1), y = Freq / sum(Freq))) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(Freq / sum(Freq), accuracy = 0.1)),
+            vjust = -0.25) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Class balance", x = "TARGET", y = "Percent")
+```
+
+# AI vs Human Feature Exploration
+## AI Prompt Response
+**Prompt** 
+Here is a data dictionary. Act as a credit risk analyst and identify the top 15-20 variables you believe would be most predictive of TARGET, based only on the meaning of the variables.
+
+**Result**
+Application (current loan & borrower profile)
+
+EXT_SOURCE_1 / EXT_SOURCE_2 / EXT_SOURCE_3 — external normalized risk scores; typically the strongest single predictors of default because they compress rich bureau/behavioral info into calibrated scores.
+
+AMT_ANNUITY — the borrower’s required periodic payment; larger payments raise payment-to-income pressure.
+
+AMT_CREDIT — loan size; bigger exposure increases absolute burden and correlates with underwriting tier.
+
+AMT_INCOME_TOTAL — borrower income; core capacity-to-repay input (used implicitly in debt-to-income).
+
+DAYS_EMPLOYED — tenure/proxy for job stability; shorter tenure and employment gaps raise risk.
+
+DAYS_BIRTH — age; very young/very old segments often show higher risk (U-shapes are common).
+
+REGION_RATING_CLIENT (or REGION_RATING_CLIENT_W_CITY) — lender’s regional risk rating; captures macro & local default risk.
+
+NAME_INCOME_TYPE — income source category (e.g., Working, Pensioner); stability varies by type.
+
+NAME_EDUCATION_TYPE — education attainment; proxy for lifetime earnings/stability.
+
+NAME_FAMILY_STATUS and/or CNT_CHILDREN — household obligations affect free cash flow and stress.
+
+Credit Bureau (external current/closed credits)
+
+AMT_CREDIT_SUM_DEBT — total current debt across bureau; direct debt load indicator.
+
+AMT_CREDIT_SUM_OVERDUE — current overdue amount; a near-term distress signal.
+
+AMT_CREDIT_MAX_OVERDUE — worst historical arrears; captures severity of past delinquency.
+
+CNT_CREDIT_PROLONG — number of prolongations/extensions; restructurings suggest stress.
+
+DAYS_CREDIT_UPDATE (or DAYS_CREDIT_ENDDATE / DAYS_ENDDATE_FACT) — recency of bureau updates/closures; very recent closures or stale updates can both be risk flags depending on context.
+
+CREDIT_ACTIVE — whether other loans are active; portfolio complexity and current obligations.
+
+AMT_CREDIT_SUM — total credit amount (exposure) on bureau; complements debt & utilization views.
+
+Previous Applications (with the lender)
+
+NAME_CONTRACT_STATUS — history of Refused, Approved, Canceled; refusals/terminations are adverse signals.
+
+DAYS_DECISION — how recent prior decisions were; recent activity (esp. multiple) can indicate credit shopping.
+
+AMT_DOWN_PAYMENT — “skin in the game”; lower down payments increase probability of default.
+
+CNT_PAYMENT — planned number of installments; longer terms can both ease payments and mask risk—useful context.
+
+Installments / POS / Credit Card Behavior (payment performance history)
+
+installments_payments: DAYS_ENTRY_PAYMENT & DAYS_INSTALMENT — their gap reflects payment timeliness (lateness → risk).
+
+installments_payments: AMT_PAYMENT & AMT_INSTALMENT — under- or over-payment behavior; shortfalls are red flags.
+
+POS_CASH_balance: SK_DPD_DEF — “bad” DPD metric that ignores trivial debts; cleaner delinquency signal.
+
+credit_card_balance: AMT_BALANCE & AMT_CREDIT_LIMIT_ACTUAL — together proxy utilization; high utilization correlates with distress.
+
+credit_card_balance: AMT_INST_MIN_REGULARITY vs AMT_PAYMENT_TOTAL_CURRENT — meeting minimums is a key early-warning indicator.
+
+Why these?
+
+They cover the classic pillars of credit risk—capacity (income, annuity, loan size), character/behavior (delinquencies, overdues, prior refusals, payment timing), current leverage (total debt, utilization), and context (age, employment tenure, regional risk, income/education type). If I could only start with ~18–20 columns by meaning alone, this is the portfolio I’d pick.
+
+**Brief Critique of Reasoning**
+I think that a lot of the variables chosen and reasoning given are quite sound. Some I wouldn't be so sure. Some that I question are DAYS_BIRTH (age), NAME_INCOME_TYPE, DAYS_CREDIT_UPDATE, DAYS_DECISION.
+
+# Relationship Exploration
+```{r}
+# Make data frame w/ target as 0 / 1, factorize to labels
+train$TARGET <- factor(train$TARGET, levels = c(0,1), labels = c("no","yes"))
+
+# Check class balance
+table(train$TARGET)
+prop.table(table(train$TARGET))
+
+# Based on AI exercise, picking a few variables to inspect.
+pref_num <- c("AMT_ANNUITY","AMT_CREDIT","AMT_INCOME_TOTAL",
+              "DAYS_BIRTH","DAYS_EMPLOYED","REGION_RATING_CLIENT")
+pref_cat <- c("NAME_INCOME_TYPE","NAME_EDUCATION_TYPE","NAME_FAMILY_STATUS")
+
+nums_to_plot <- intersect(pref_num, names(train))
+cats_to_plot <- intersect(pref_cat, names(train))
+```
+## Historgram & Boxplot
+```{r}
+# Histograms
+op <- par(mfrow = c(2,2))
+for (v in head(nums_to_plot, 4)) {
+  hist(train[[v]], main = paste("Histogram:", v), xlab = v, col = "gray")
+}
+par(op)
+
+# Boxplots
+for (v in nums_to_plot) {
+  boxplot(train[[v]] ~ train$TARGET,
+          main = paste("Boxplot of", v, "by TARGET"),
+          xlab = "TARGET", ylab = v, col = c("lightgray","lightblue"))
+}
+```
+From the histograms, we can see that AMT_ANNUITY, CREDIT, and INCOME_TOTAL have a strong right skew - lots of small / medium amounts but a long tail to the right. REGION_RATING_CLIENT is pretty normal / regular.
+From the box plots, it doesn't really seem like any of the variables have a strong relationship with the target.
+
+## Deciles by Target
+```{r}
+# Deciles
+get_deciles <- function(x) quantile(x, probs = seq(0,1,0.1), na.rm = TRUE)
+
+decile_tbl <- do.call(rbind, lapply(nums_to_plot, function(v){
+  d0 <- get_deciles(train[train$TARGET=="no",  v])
+  d1 <- get_deciles(train[train$TARGET=="yes", v])
+  rbind(
+    data.frame(var=v, TARGET="no",  t(d0), check.names=FALSE),
+    data.frame(var=v, TARGET="yes", t(d1), check.names=FALSE)
+  )
+}))
+decile_tbl
+
+# Aggregate summaries by target.
+agg_list <- lapply(nums_to_plot, function(v){
+  out <- aggregate(train[[v]], by = list(TARGET=train$TARGET), FUN = summary)
+  names(out)[2] <- v; out
+})
+agg_list
+```
+If we break down the numbers, we can see that there is a slight shift towards 'YES', meaning larger payments could be associated with default but it would be a weak association.
+AMT_CREDIT shows no meaningful relationship.
+AMT_INCOME_TOTAL shows a pattern that 'YES' is consistently lower from the median (135k) upwards (to 225k). Meaning, lower income would align with higher default rates.
+And REGION_RATING_CLIENT shows little to no relationship.
+
+## Numeric - Numeric Relationships
+```{r}
+# Relationship & Pairs Panels
+nums_for_corr <- intersect(nums_to_plot, names(train))
+
+nums_for_corr <- nums_for_corr[sapply(train[nums_for_corr], is.numeric)]
+
+cor_mat <- cor(train[nums_for_corr], use = "pairwise.complete.obs")
+round(cor_mat, 3)
+
+pairs.panels(train[nums_for_corr],
+             gap = 0, method = "pearson",
+             hist.col = "gray", density = TRUE, ellipses = FALSE)
+```
+The pairs panels shows us that there is actually quite a strong correlation between AMT_ANNUITY and AMT_CREDIT. This makes sense, as they are pretty redundant.
+Similar to what we saw above, all have a right skew besides region_rating_client.
+I don't think that the scatterplots tell us much about any patterns in the data.
+
+## Categorical vs Target: Counts and Target rate per level
+```{r}
+for (v in cats_to_plot) {
+  cat("\n==== ", v, " ====\n", sep = "")
+  tab <- table(train[[v]], train$TARGET, useNA = "ifany")
+  print(addmargins(tab))
+
+  # Target rate by level
+  rate <- prop.table(tab, margin = 1)[, "yes"]
+  rate <- sort(rate, decreasing = TRUE)
+  print(round(rate, 3))
+
+  # Simple barplot
+  barplot(tab, beside = TRUE, legend = TRUE,
+          main = paste(v, "by TARGET"), ylab = "Count", xlab = v)
+}
+```
+I think it gets way more interesting when we look at the categorical variable results.
+For education, we can see that default risk declines with higher education. For family status, single and civil marriage groups sit above the default risk baseline while the rest (separated, married, widowed) sit below. Differences are slight but noteable.
+
